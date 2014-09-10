@@ -3,16 +3,20 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	httpclient "github.com/mreiferson/go-httpclient"
+	"github.com/op/go-logging"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+var log = logging.MustGetLogger("gogorobot")
+var format = "%{color}%{time:15:04:05.000000} ▶ %{level:.4s} %{id:03x}%{color:reset} %{message}"
 
 type RobotResponse struct {
 	Domain    string
@@ -34,12 +38,13 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 	client := &http.Client{Transport: transport}
 	//
 	for domain := range fetchPipeline {
-		log.Println("FTCH: Fetching " + domain)
+		log.Debug(fmt.Sprintf("FTCH: Fetching %s", domain))
 		// RFC[3.1] states robots.txt must be accessible via HTTP
 		url := "http://" + domain + "/robots.txt"
 		req, _ := http.NewRequest("GET", url, nil)
 		resp, err := client.Do(req)
 		if err != nil {
+			// Domain with no URL implies extreme badness
 			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil}
 			continue
 		}
@@ -66,10 +71,10 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 		}
 		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body}
 	}
-	log.Println("FTCH: Exiting", fetchGroup)
+	log.Debug(fmt.Sprintf("FTCH: Exiting %#v", fetchGroup))
 }
 
-func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
+func saveRobots(savePipeline chan RobotResponse, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// Open database
 	db, err := sql.Open("sqlite3", "./robots.db")
@@ -88,7 +93,7 @@ func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
 	rows.Scan(&tableCreated)
 	//
 	if !tableCreated {
-		log.Println("Creating robots table...")
+		log.Debug("Creating robots table...")
 		createSql := `CREATE TABLE robots(
 			id INTEGER NOT NULL PRIMARY KEY,
 			domain TEXT,
@@ -104,6 +109,9 @@ func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
 	}
 	rows.Close()
 
+	// Ticker -- commit once per second
+	tick := time.Tick(1 * time.Second)
+	saveCount := 0
 	// Begin transaction
 	tx, err := db.Begin()
 	if err != nil {
@@ -116,27 +124,56 @@ func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer insertSql.Close()
 
-	for resp := range c {
-		log.Println("SV: Saving", resp.Domain)
-		_, err = insertSql.Exec(
-			resp.Domain,
-			resp.Url,
-			resp.HasRobots,
-			resp.FetchTime,
-			string(resp.Body),
-		)
-		if err != nil {
-			log.Fatal(err)
+Loop:
+	for {
+		select {
+		case resp, channelOpen := <-savePipeline:
+			if !channelOpen {
+				break Loop
+			}
+			log.Debug(fmt.Sprintf("SV: Saving %s", resp.Domain))
+			_, err = insertSql.Exec(
+				resp.Domain,
+				resp.Url,
+				resp.HasRobots,
+				resp.FetchTime,
+				string(resp.Body),
+			)
+			if err != nil {
+				log.Fatal(err)
+			}
+			saveCount += 1
+			log.Debug(fmt.Sprintf("SV: Saved %s", resp.Domain))
+		case <-tick:
+			log.Notice("Saving... %d in one second\n", saveCount)
+			saveCount = 0
+			// Reset counter and end old transaction
+			err = tx.Commit()
+			if err != nil {
+				log.Fatal(err)
+			}
+			insertSql.Close()
+			// Start new transaction
+			tx, err = db.Begin()
+			if err != nil {
+				log.Fatal(err)
+			}
+			// Generate statement to insert entries
+			insertSql, err = tx.Prepare(`insert into
+				robots(domain, url, hasRobots, fetchTime, body)
+				values(?, ?, ?, ?, ?)`)
+			if err != nil {
+				log.Fatal(err)
+			}
+
 		}
-		log.Println("SV: Saved", resp.Domain)
 	}
-
 	err = tx.Commit()
 	if err != nil {
 		log.Fatal(err)
 	}
+	insertSql.Close()
 	// End transaction
 
 	// Check how many we have
@@ -145,13 +182,16 @@ func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
 		log.Fatal(err)
 	}
 	rows.Next()
-	var total string
+	var total int
 	rows.Scan(&total)
-	log.Println(total)
+	log.Debug(fmt.Sprintf("Total URLs in DB: %d", total))
 	rows.Close()
 }
 
 func main() {
+	logging.SetFormatter(logging.MustStringFormatter(format))
+	logging.SetLevel(logging.INFO, "gogorobot")
+	//
 	fetchPipeline := make(chan string)
 	savePipeline := make(chan RobotResponse)
 	// NOTE: Important to pass via pointer
@@ -162,7 +202,7 @@ func main() {
 	saveGroup.Add(1)
 	go saveRobots(savePipeline, &saveGroup)
 
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < 5000; i++ {
 		fetchGroup.Add(1)
 		go fetchRobot(fetchPipeline, savePipeline, &fetchGroup)
 	}
@@ -175,6 +215,7 @@ func main() {
 			break
 		}
 		domain = strings.TrimRight(domain, "\r\n")
+		log.Debug(fmt.Sprintf("MAIN: Providing %s to fetch pipeline", domain))
 		fetchPipeline <- domain
 	}
 	close(fetchPipeline)
