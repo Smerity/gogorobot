@@ -13,7 +13,15 @@ import (
 	"time"
 )
 
-func fetchRobot(domain string) (bool, string, []byte) {
+type RobotResponse struct {
+	Domain    string
+	Url       string
+	HasRobots bool
+	FetchTime time.Time
+	Body      []byte
+}
+
+func fetchRobot(domain string) RobotResponse {
 	// RFC[3.1] states robots.txt must be accessible via HTTP
 	url := "http://" + domain + "/robots.txt"
 	resp, err := http.Get(url)
@@ -25,13 +33,13 @@ func fetchRobot(domain string) (bool, string, []byte) {
 	finalUrl := resp.Request.URL.String()
 	// RFC[3.1] states 2xx should be considered success
 	if resp.StatusCode < 200 || resp.StatusCode > 206 {
-		return false, finalUrl, nil
+		return RobotResponse{domain, finalUrl, false, time.Now(), nil}
 	}
 	// RFC[3.1] states robots.txt should be text/plain
 	// TODO: Handle silly sites like http://www.weibo.com/robots.txt => text/html
 	for _, mtype := range resp.Header["Content-Type"] {
 		if !strings.HasPrefix(mtype, "text/plain") {
-			return false, finalUrl, nil
+			return RobotResponse{domain, finalUrl, false, time.Now(), nil}
 		}
 	}
 	//
@@ -39,7 +47,7 @@ func fetchRobot(domain string) (bool, string, []byte) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	return true, finalUrl, body
+	return RobotResponse{domain, finalUrl, true, time.Now(), body}
 }
 
 func main() {
@@ -66,7 +74,7 @@ func main() {
 			domain TEXT,
 			url TEXT,
 			hasRobots INT,
-			fetched TIMESTAMP,
+			fetchTime TIMESTAMP,
 			body TEXT
 			)`
 		_, err = db.Exec(createSql)
@@ -83,7 +91,7 @@ func main() {
 	}
 	// Generate statement to insert entries
 	insertSql, err := tx.Prepare(`insert into
-		robots(domain, url, hasRobots, fetched, body)
+		robots(domain, url, hasRobots, fetchTime, body)
 		values(?, ?, ?, ?, ?)`)
 	if err != nil {
 		log.Fatal(err)
@@ -100,9 +108,15 @@ func main() {
 		}
 		log.Println("Fetching " + domain)
 
-		success, url, body := fetchRobot(domain)
+		resp := fetchRobot(domain)
 
-		_, err = insertSql.Exec(domain, url, success, time.Now(), string(body))
+		_, err = insertSql.Exec(
+			resp.Domain,
+			resp.Url,
+			resp.HasRobots,
+			resp.FetchTime,
+			string(resp.Body),
+		)
 		if err != nil {
 			log.Fatal(err)
 		}
