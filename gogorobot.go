@@ -3,13 +3,13 @@ package main
 import (
 	"bufio"
 	"database/sql"
-	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,39 +21,47 @@ type RobotResponse struct {
 	Body      []byte
 }
 
-func fetchRobot(domain string, c chan RobotResponse) {
-	// RFC[3.1] states robots.txt must be accessible via HTTP
-	url := "http://" + domain + "/robots.txt"
-	resp, err := http.Get(url)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-	// Work out what the final request URL is
-	finalUrl := resp.Request.URL.String()
-	// RFC[3.1] states 2xx should be considered success
-	if resp.StatusCode < 200 || resp.StatusCode > 206 {
-		c <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
-		return
-	}
-	// RFC[3.1] states robots.txt should be text/plain
-	// TODO: Handle silly sites like http://www.weibo.com/robots.txt => text/html
-	for _, mtype := range resp.Header["Content-Type"] {
-		if !strings.HasPrefix(mtype, "text/plain") {
-			c <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
-			return
-		}
-	}
+func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetchGroup *sync.WaitGroup) {
+	//defer fetchGroup.Done()
 	//
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatal(err)
+	for domain := range fetchPipeline {
+		log.Println("FTCH: Fetching " + domain)
+		// RFC[3.1] states robots.txt must be accessible via HTTP
+		url := "http://" + domain + "/robots.txt"
+		resp, err := http.Get(url)
+		if err != nil {
+			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil}
+			continue
+		}
+		defer resp.Body.Close()
+		// Work out what the final request URL is
+		finalUrl := resp.Request.URL.String()
+		// RFC[3.1] states 2xx should be considered success
+		if resp.StatusCode < 200 || resp.StatusCode > 206 {
+			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			continue
+		}
+		// RFC[3.1] states robots.txt should be text/plain
+		// TODO: Handle silly sites like http://www.weibo.com/robots.txt => text/html
+		for _, mtype := range resp.Header["Content-Type"] {
+			if !strings.HasPrefix(mtype, "text/plain") {
+				savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+				continue
+			}
+		}
+		//
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Fatal(err)
+		}
+		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body}
 	}
-	c <- RobotResponse{domain, finalUrl, true, time.Now(), body}
-	return
+	fetchGroup.Done()
+	log.Println("FTCH: Exiting", fetchGroup)
 }
 
-func main() {
+func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
+	defer wg.Done()
 	// Open database
 	db, err := sql.Open("sqlite3", "./robots.db")
 	if err != nil {
@@ -101,20 +109,8 @@ func main() {
 	}
 	defer insertSql.Close()
 
-	// Insert entries
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		domain, err := reader.ReadString('\n')
-		domain = strings.TrimRight(domain, "\r\n")
-		if err != nil {
-			break
-		}
-		log.Println("Fetching " + domain)
-
-		c := make(chan RobotResponse)
-		go fetchRobot(domain, c)
-		resp := <-c
-
+	for resp := range c {
+		log.Println("SV: Saving", resp.Domain)
 		_, err = insertSql.Exec(
 			resp.Domain,
 			resp.Url,
@@ -125,7 +121,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		log.Println("SV: Saved", resp.Domain)
 	}
+
 	err = tx.Commit()
 	if err != nil {
 		log.Fatal(err)
@@ -140,6 +138,37 @@ func main() {
 	rows.Next()
 	var total string
 	rows.Scan(&total)
-	fmt.Println(total)
+	log.Println(total)
 	rows.Close()
+}
+
+func main() {
+	fetchPipeline := make(chan string)
+	savePipeline := make(chan RobotResponse)
+	var fetchGroup sync.WaitGroup
+	var saveGroup sync.WaitGroup
+
+	saveGroup.Add(1)
+	go saveRobots(savePipeline, &saveGroup)
+
+	for i := 0; i < 10000; i++ {
+		fetchGroup.Add(1)
+		go fetchRobot(fetchPipeline, savePipeline, &fetchGroup)
+	}
+
+	// Insert entries
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		domain, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		domain = strings.TrimRight(domain, "\r\n")
+		fetchPipeline <- domain
+	}
+	close(fetchPipeline)
+	//
+	fetchGroup.Wait()
+	close(savePipeline)
+	saveGroup.Wait()
 }
