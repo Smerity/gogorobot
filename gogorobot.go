@@ -8,6 +8,7 @@ import (
 	httpclient "github.com/mreiferson/go-httpclient"
 	"github.com/op/go-logging"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -30,9 +31,10 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 	defer fetchGroup.Done()
 	// Set timeout details for HTTP GET requests
 	transport := &httpclient.Transport{
-		ConnectTimeout:        10 * time.Second,
-		RequestTimeout:        30 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
+		// Prime times are useful if there's an obvious bottleneck
+		ConnectTimeout:        13 * time.Second,
+		RequestTimeout:        31 * time.Second,
+		ResponseHeaderTimeout: 17 * time.Second,
 	}
 	defer transport.Close()
 	client := &http.Client{Transport: transport}
@@ -41,6 +43,8 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 		log.Debug(fmt.Sprintf("FTCH: Fetching %s", domain))
 		// RFC[3.1] states robots.txt must be accessible via HTTP
 		url := "http://" + domain + "/robots.txt"
+		// Jitter the connection timings to prevent all the connections starting at once
+		time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 		req, _ := http.NewRequest("GET", url, nil)
 		resp, err := client.Do(req)
 		if err != nil {
@@ -110,7 +114,8 @@ func saveRobots(savePipeline chan RobotResponse, wg *sync.WaitGroup) {
 	rows.Close()
 
 	// Ticker -- commit once per second
-	tick := time.Tick(1 * time.Second)
+	delay := 5 * time.Second
+	tick := time.Tick(delay)
 	saveCount := 0
 	// Begin transaction
 	tx, err := db.Begin()
@@ -146,7 +151,9 @@ Loop:
 			saveCount += 1
 			log.Debug(fmt.Sprintf("SV: Saved %s", resp.Domain))
 		case <-tick:
-			log.Notice("Saving... %d in one second\n", saveCount)
+			// Workaround for bug in SQLite driver
+			// If it's once per second, it somehow hits itself... "Can't open database file"
+			log.Notice("Saving... %d in %s\n", saveCount, delay)
 			saveCount = 0
 			// Reset counter and end old transaction
 			err = tx.Commit()
@@ -202,7 +209,8 @@ func main() {
 	saveGroup.Add(1)
 	go saveRobots(savePipeline, &saveGroup)
 
-	for i := 0; i < 5000; i++ {
+	// 1000 goroutines are enough for ~3800 transactions per second
+	for i := 0; i < 1000; i++ {
 		fetchGroup.Add(1)
 		go fetchRobot(fetchPipeline, savePipeline, &fetchGroup)
 	}
