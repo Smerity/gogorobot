@@ -21,7 +21,7 @@ type RobotResponse struct {
 	Body      []byte
 }
 
-func fetchRobot(domain string) RobotResponse {
+func fetchRobot(domain string, c chan RobotResponse) {
 	// RFC[3.1] states robots.txt must be accessible via HTTP
 	url := "http://" + domain + "/robots.txt"
 	resp, err := http.Get(url)
@@ -33,13 +33,15 @@ func fetchRobot(domain string) RobotResponse {
 	finalUrl := resp.Request.URL.String()
 	// RFC[3.1] states 2xx should be considered success
 	if resp.StatusCode < 200 || resp.StatusCode > 206 {
-		return RobotResponse{domain, finalUrl, false, time.Now(), nil}
+		c <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+		return
 	}
 	// RFC[3.1] states robots.txt should be text/plain
 	// TODO: Handle silly sites like http://www.weibo.com/robots.txt => text/html
 	for _, mtype := range resp.Header["Content-Type"] {
 		if !strings.HasPrefix(mtype, "text/plain") {
-			return RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			c <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			return
 		}
 	}
 	//
@@ -47,7 +49,8 @@ func fetchRobot(domain string) RobotResponse {
 	if err != nil {
 		log.Fatal(err)
 	}
-	return RobotResponse{domain, finalUrl, true, time.Now(), body}
+	c <- RobotResponse{domain, finalUrl, true, time.Now(), body}
+	return
 }
 
 func main() {
@@ -108,7 +111,9 @@ func main() {
 		}
 		log.Println("Fetching " + domain)
 
-		resp := fetchRobot(domain)
+		c := make(chan RobotResponse)
+		go fetchRobot(domain, c)
+		resp := <-c
 
 		_, err = insertSql.Exec(
 			resp.Domain,
