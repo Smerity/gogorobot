@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
+	httpclient "github.com/mreiferson/go-httpclient"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -22,13 +23,22 @@ type RobotResponse struct {
 }
 
 func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetchGroup *sync.WaitGroup) {
-	//defer fetchGroup.Done()
+	defer fetchGroup.Done()
+	// Set timeout details for HTTP GET requests
+	transport := &httpclient.Transport{
+		ConnectTimeout:        10 * time.Second,
+		RequestTimeout:        30 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}
+	defer transport.Close()
+	client := &http.Client{Transport: transport}
 	//
 	for domain := range fetchPipeline {
 		log.Println("FTCH: Fetching " + domain)
 		// RFC[3.1] states robots.txt must be accessible via HTTP
 		url := "http://" + domain + "/robots.txt"
-		resp, err := http.Get(url)
+		req, _ := http.NewRequest("GET", url, nil)
+		resp, err := client.Do(req)
 		if err != nil {
 			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil}
 			continue
@@ -56,7 +66,6 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 		}
 		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body}
 	}
-	fetchGroup.Done()
 	log.Println("FTCH: Exiting", fetchGroup)
 }
 
@@ -145,6 +154,8 @@ func saveRobots(c chan RobotResponse, wg *sync.WaitGroup) {
 func main() {
 	fetchPipeline := make(chan string)
 	savePipeline := make(chan RobotResponse)
+	// NOTE: Important to pass via pointer
+	// Otherwise, a new WaitGroup is created
 	var fetchGroup sync.WaitGroup
 	var saveGroup sync.WaitGroup
 
