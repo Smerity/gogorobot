@@ -13,6 +13,19 @@ import (
 	"time"
 )
 
+func fetchRobot(url string) []byte {
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return body
+}
+
 func main() {
 	// Open database
 	db, err := sql.Open("sqlite3", "./robots.db")
@@ -26,32 +39,31 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer rows.Close()
 	rows.Next()
 	var tableCreated bool
 	rows.Scan(&tableCreated)
 	//
-	createSql := `CREATE TABLE robots(
-		id INTEGER NOT NULL PRIMARY KEY,
-		url TEXT,
-		fetched TIMESTAMP,
-		body TEXT
-		)`
-
 	if !tableCreated {
 		log.Println("Creating robots table...")
+		createSql := `CREATE TABLE robots(
+			id INTEGER NOT NULL PRIMARY KEY,
+			url TEXT,
+			fetched TIMESTAMP,
+			body TEXT
+			)`
 		_, err = db.Exec(createSql)
 		if err != nil {
-			log.Printf("%q: %s\n", err, createSql)
-			return
+			log.Fatal(err)
 		}
 	}
+	rows.Close()
 
-	// Generate statement to insert entries
+	// Begin transaction
 	tx, err := db.Begin()
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Generate statement to insert entries
 	insertSql, err := tx.Prepare(`insert into
 		robots(url, fetched, body)
 		values(?, ?, ?)`)
@@ -70,29 +82,27 @@ func main() {
 		}
 		log.Println("Fetching " + url)
 
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body := fetchRobot(url)
 
 		_, err = insertSql.Exec(url, time.Now(), string(body))
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
-	tx.Commit()
+	err = tx.Commit()
+	if err != nil {
+		log.Fatal(err)
+	}
+	// End transaction
 
 	// Check how many we have
 	rows, err = db.Query("SELECT COUNT(*) FROM robots")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var total string
-		rows.Scan(&total)
-		fmt.Println(total)
-	}
+	rows.Next()
+	var total string
+	rows.Scan(&total)
+	fmt.Println(total)
+	rows.Close()
 }
