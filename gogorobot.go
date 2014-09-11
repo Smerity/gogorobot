@@ -9,6 +9,7 @@ import (
 	"github.com/op/go-logging"
 	"io/ioutil"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -17,7 +18,7 @@ import (
 )
 
 var log = logging.MustGetLogger("gogorobot")
-var format = "%{color}%{time:15:04:05.000000} ▶ %{level:.4s} %{id:03x}%{color:reset} %{message}"
+var format = "%{color}%{time:15:04:05.000000} ▶ %{level:.4s} %{id:03x}%{color:reset} %{shortfile} %{message}"
 
 type RobotResponse struct {
 	Domain    string
@@ -32,7 +33,7 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 	// Set timeout details for HTTP GET requests
 	transport := &httpclient.Transport{
 		// Prime times are useful if there's an obvious bottleneck
-		ConnectTimeout:        13 * time.Second,
+		ConnectTimeout:        27 * time.Second,
 		RequestTimeout:        31 * time.Second,
 		ResponseHeaderTimeout: 17 * time.Second,
 	}
@@ -48,8 +49,15 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 		req, _ := http.NewRequest("GET", url, nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			// Domain with no URL implies extreme badness
+			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+				// If it's a timeout, the connection wasn't made or even failed -- try again
+				log.Info("Restarting request due to timeout...")
+				fetchPipeline <- domain
+				continue
+			}
+			// Otherwise, save as domain with no URL -- implies extreme badness
 			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil}
+			log.Info(fmt.Sprintf("%s", err))
 			continue
 		}
 		defer resp.Body.Close()
