@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	_ "crypto/sha512" // See http://bridge.grumpy-troll.org/2014/05/golang-tls-comodo/
 	"database/sql"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
