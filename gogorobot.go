@@ -8,12 +8,12 @@ import (
 	httpclient "github.com/mreiferson/go-httpclient"
 	"github.com/op/go-logging"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -32,10 +32,15 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 	defer fetchGroup.Done()
 	// Set timeout details for HTTP GET requests
 	transport := &httpclient.Transport{
-		// Prime times are useful if there's an obvious bottleneck
+		// Prime times are useful as one can see when there's an obvious bottleneck
 		ConnectTimeout:        27 * time.Second,
 		RequestTimeout:        31 * time.Second,
 		ResponseHeaderTimeout: 17 * time.Second,
+		// After we use the connection once, we won't be using it again as robots.txt is all we want
+		DisableKeepAlives: true,
+		// In Go 1.2.1, short gzip body responses can result in failures and leaking connections
+		// See https://codereview.appspot.com/84850043 for more details
+		DisableCompression: true,
 	}
 	defer transport.Close()
 	client := &http.Client{Transport: transport}
@@ -44,43 +49,48 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 		log.Debug(fmt.Sprintf("FTCH: Fetching %s", domain))
 		// RFC[3.1] states robots.txt must be accessible via HTTP
 		url := "http://" + domain + "/robots.txt"
-		// Jitter the connection timings to prevent all the connections starting at once
-		time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 		req, _ := http.NewRequest("GET", url, nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// If it's a timeout, the connection wasn't made or even failed -- try again
-				log.Info("Restarting request due to timeout...")
+				log.Debug("Restarting request due to timeout...")
 				fetchPipeline <- domain
 				continue
 			}
 			// Otherwise, save as domain with no URL -- implies extreme badness
 			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil}
-			log.Info(fmt.Sprintf("%s", err))
+			log.Debug(fmt.Sprintf("%s", err))
 			continue
 		}
-		defer resp.Body.Close()
 		// Work out what the final request URL is
 		finalUrl := resp.Request.URL.String()
 		// RFC[3.1] states 2xx should be considered success
 		if resp.StatusCode < 200 || resp.StatusCode > 206 {
 			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			resp.Body.Close()
 			continue
 		}
 		// RFC[3.1] states robots.txt should be text/plain
 		// TODO: Handle silly sites like http://www.weibo.com/robots.txt => text/html
+		isPlaintext := true
 		for _, mtype := range resp.Header["Content-Type"] {
 			if !strings.HasPrefix(mtype, "text/plain") {
-				savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
-				continue
+				isPlaintext = false
+				break
 			}
+		}
+		if !isPlaintext {
+			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			resp.Body.Close()
+			continue
 		}
 		//
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			log.Fatal(err)
 		}
+		resp.Body.Close()
 		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body}
 	}
 	log.Debug(fmt.Sprintf("FTCH: Exiting %#v", fetchGroup))
@@ -122,9 +132,10 @@ func saveRobots(savePipeline chan RobotResponse, wg *sync.WaitGroup) {
 	rows.Close()
 
 	// Ticker -- commit once per second
-	delay := 5 * time.Second
+	delay := 1 * time.Second
 	tick := time.Tick(delay)
 	saveCount := 0
+	failCount := 0
 	// Begin transaction
 	tx, err := db.Begin()
 	if err != nil {
@@ -156,13 +167,16 @@ Loop:
 			if err != nil {
 				log.Fatal(err)
 			}
+			if resp.Url == "" {
+				failCount += 1
+			}
 			saveCount += 1
 			log.Debug(fmt.Sprintf("SV: Saved %s", resp.Domain))
 		case <-tick:
-			// Workaround for bug in SQLite driver
-			// If it's once per second, it somehow hits itself... "Can't open database file"
 			log.Notice("Saving... %d in %s\n", saveCount, delay)
+			log.Notice("Failing... %d in %s\n", failCount, delay)
 			saveCount = 0
+			failCount = 0
 			// Reset counter and end old transaction
 			err = tx.Commit()
 			if err != nil {
@@ -206,6 +220,20 @@ Loop:
 func main() {
 	logging.SetFormatter(logging.MustStringFormatter(format))
 	logging.SetLevel(logging.INFO, "gogorobot")
+	logging.SetLevel(logging.DEBUG, "gogorobot")
+	//
+	// Set the file descriptor limit higher if we've permission
+	var rLimit syscall.Rlimit
+	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Info(fmt.Sprintf("Error geting rlimit: %s", err))
+	}
+	rLimit.Max = 65536
+	rLimit.Cur = 65536
+	err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Info(fmt.Sprintf("Error setting rlimit: %s", err))
+	}
 	//
 	fetchPipeline := make(chan string)
 	savePipeline := make(chan RobotResponse)
@@ -217,8 +245,7 @@ func main() {
 	saveGroup.Add(1)
 	go saveRobots(savePipeline, &saveGroup)
 
-	// 1000 goroutines are enough for ~3800 transactions per second
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 250; i++ {
 		fetchGroup.Add(1)
 		go fetchRobot(fetchPipeline, savePipeline, &fetchGroup)
 	}
@@ -235,6 +262,7 @@ func main() {
 		fetchPipeline <- domain
 	}
 	close(fetchPipeline)
+	log.Notice("Fetching pipeline closed -- waiting for pending fetches to complete")
 	//
 	fetchGroup.Wait()
 	close(savePipeline)
