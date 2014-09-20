@@ -1,15 +1,23 @@
 package main
 
+// Special notes re: DNS resolution
+// https://code.google.com/p/go/issues/detail?id=3575
+// https://groups.google.com/forum/#!topic/golang-nuts/pP3zyUlbT00
+// http://grokbase.com/t/gg/golang-nuts/142vch7a3t/go-nuts-tcp-dial-dns-lookup-errors
+// https://groups.google.com/forum/#!topic/golang-nuts/wliZf2_LUag
+// nasa.gov & navy.mil fail as they require www
+
 import (
 	"bufio"
 	_ "crypto/sha512" // See http://bridge.grumpy-troll.org/2014/05/golang-tls-comodo/
 	"database/sql"
+	"errors"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	httpclient "github.com/mreiferson/go-httpclient"
 	"github.com/op/go-logging"
+	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -21,15 +29,21 @@ import (
 var log = logging.MustGetLogger("gogorobot")
 var format = "%{color}%{time:15:04:05.000000} ▶ %{level:.4s} %{id:03x}%{color:reset} %{shortfile} %{message}"
 
+type FetchRequest struct {
+	Domain  string
+	Attempt uint
+}
+
 type RobotResponse struct {
 	Domain    string
 	Url       string
 	HasRobots bool
 	FetchTime time.Time
 	Body      []byte
+	Redirects int
 }
 
-func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetchGroup *sync.WaitGroup) {
+func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse, fetchGroup *sync.WaitGroup) {
 	defer fetchGroup.Done()
 	// Set timeout details for HTTP GET requests
 	transport := &httpclient.Transport{
@@ -44,31 +58,52 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 		DisableCompression: true,
 	}
 	defer transport.Close()
-	client := &http.Client{Transport: transport}
+	// Following test in src/pkg/net/http/client_test
+	var lastVia []*http.Request
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			lastVia = via
+			if len(via) > 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return nil
+		},
+	}
 	//
-	for domain := range fetchPipeline {
-		log.Debug(fmt.Sprintf("FTCH: Fetching %s", domain))
+	for fr := range fetchPipeline {
+		lastVia = []*http.Request{}
+		domain := fr.Domain
+		fr.Attempt += 1
+		if fr.Attempt > 5 {
+			log.Error(fmt.Sprintf("FTCH: Maximum attempts reached for %s", domain))
+			continue
+		}
+		log.Debug(fmt.Sprintf("FTCH: Fetching %s on attempt %d", domain, fr.Attempt))
 		// RFC[3.1] states robots.txt must be accessible via HTTP
 		url := "http://" + domain + "/robots.txt"
 		req, _ := http.NewRequest("GET", url, nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			if netErr, ok := err.(interface {
+				Timeout() bool
+			}); ok && netErr.Timeout() {
 				// If it's a timeout, the connection wasn't made or even failed -- try again
-				log.Debug("Restarting request due to timeout...")
-				fetchPipeline <- domain
+				log.Warning("Restarting request due to timeout...")
+				fetchPipeline <- fr
 				continue
 			}
 			// Otherwise, save as domain with no URL -- implies extreme badness
-			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil}
-			log.Debug(fmt.Sprintf("%s", err))
+			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil, 0}
+			log.Warning(fmt.Sprintf("%s", err))
 			continue
 		}
 		// Work out what the final request URL is
 		finalUrl := resp.Request.URL.String()
 		// RFC[3.1] states 2xx should be considered success
 		if resp.StatusCode < 200 || resp.StatusCode > 206 {
-			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil, len(lastVia)}
+			io.Copy(ioutil.Discard, resp.Body)
 			resp.Body.Close()
 			continue
 		}
@@ -82,17 +117,20 @@ func fetchRobot(fetchPipeline chan string, savePipeline chan RobotResponse, fetc
 			}
 		}
 		if !isPlaintext {
-			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil}
+			savePipeline <- RobotResponse{domain, finalUrl, false, time.Now(), nil, len(lastVia)}
+			io.Copy(ioutil.Discard, resp.Body)
 			resp.Body.Close()
 			continue
 		}
 		//
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			log.Fatal(err)
+			log.Warning(fmt.Sprintf("%s", err))
+			fetchPipeline <- fr
+			continue
 		}
 		resp.Body.Close()
-		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body}
+		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body, len(lastVia)}
 	}
 	log.Debug(fmt.Sprintf("FTCH: Exiting %#v", fetchGroup))
 }
@@ -123,7 +161,8 @@ func saveRobots(savePipeline chan RobotResponse, wg *sync.WaitGroup) {
 			url TEXT,
 			hasRobots INT,
 			fetchTime TIMESTAMP,
-			body TEXT
+			body TEXT,
+			redirects TEXT
 			)`
 		_, err = db.Exec(createSql)
 		if err != nil {
@@ -144,8 +183,8 @@ func saveRobots(savePipeline chan RobotResponse, wg *sync.WaitGroup) {
 	}
 	// Generate statement to insert entries
 	insertSql, err := tx.Prepare(`insert into
-		robots(domain, url, hasRobots, fetchTime, body)
-		values(?, ?, ?, ?, ?)`)
+		robots(domain, url, hasRobots, fetchTime, body, redirects)
+		values(?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -164,6 +203,7 @@ Loop:
 				resp.HasRobots,
 				resp.FetchTime,
 				string(resp.Body),
+				resp.Redirects,
 			)
 			if err != nil {
 				log.Fatal(err)
@@ -191,8 +231,8 @@ Loop:
 			}
 			// Generate statement to insert entries
 			insertSql, err = tx.Prepare(`insert into
-				robots(domain, url, hasRobots, fetchTime, body)
-				values(?, ?, ?, ?, ?)`)
+				robots(domain, url, hasRobots, fetchTime, body, redirects)
+				values(?, ?, ?, ?, ?, ?)`)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -221,7 +261,7 @@ Loop:
 func main() {
 	logging.SetFormatter(logging.MustStringFormatter(format))
 	logging.SetLevel(logging.INFO, "gogorobot")
-	logging.SetLevel(logging.DEBUG, "gogorobot")
+	//logging.SetLevel(logging.DEBUG, "gogorobot")
 	//
 	// Set the file descriptor limit higher if we've permission
 	var rLimit syscall.Rlimit
@@ -236,7 +276,7 @@ func main() {
 		log.Info(fmt.Sprintf("Error setting rlimit: %s", err))
 	}
 	//
-	fetchPipeline := make(chan string)
+	fetchPipeline := make(chan FetchRequest)
 	savePipeline := make(chan RobotResponse)
 	// NOTE: Important to pass via pointer
 	// Otherwise, a new WaitGroup is created
@@ -246,7 +286,7 @@ func main() {
 	saveGroup.Add(1)
 	go saveRobots(savePipeline, &saveGroup)
 
-	for i := 0; i < 250; i++ {
+	for i := 0; i < 50; i++ {
 		fetchGroup.Add(1)
 		go fetchRobot(fetchPipeline, savePipeline, &fetchGroup)
 	}
@@ -260,7 +300,7 @@ func main() {
 		}
 		domain = strings.TrimRight(domain, "\r\n")
 		log.Debug(fmt.Sprintf("MAIN: Providing %s to fetch pipeline", domain))
-		fetchPipeline <- domain
+		fetchPipeline <- FetchRequest{domain, 0}
 	}
 	close(fetchPipeline)
 	log.Notice("Fetching pipeline closed -- waiting for pending fetches to complete")
