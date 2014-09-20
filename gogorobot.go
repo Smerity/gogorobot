@@ -5,6 +5,7 @@ package main
 // https://groups.google.com/forum/#!topic/golang-nuts/pP3zyUlbT00
 // http://grokbase.com/t/gg/golang-nuts/142vch7a3t/go-nuts-tcp-dial-dns-lookup-errors
 // https://groups.google.com/forum/#!topic/golang-nuts/wliZf2_LUag
+// https://code.google.com/p/go/issues/detail?id=8434
 // nasa.gov & navy.mil fail as they require www
 
 import (
@@ -18,7 +19,9 @@ import (
 	"github.com/op/go-logging"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -81,22 +84,40 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 		}
 		log.Debug(fmt.Sprintf("FTCH: Fetching %s on attempt %d", domain, fr.Attempt))
 		// RFC[3.1] states robots.txt must be accessible via HTTP
-		url := "http://" + domain + "/robots.txt"
-		req, _ := http.NewRequest("GET", url, nil)
+		urlPath := "http://" + domain + "/robots.txt"
+		req, _ := http.NewRequest("GET", urlPath, nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			if netErr, ok := err.(interface {
-				Timeout() bool
-			}); ok && netErr.Timeout() {
-				// If it's a timeout, the connection wasn't made or even failed -- try again
-				log.Warning("Restarting request due to timeout...")
-				fetchPipeline <- fr
-				continue
+			for {
+				if netErr, ok := err.(interface {
+					Timeout() bool
+				}); ok && netErr.Timeout() {
+					// If it's a timeout, the connection wasn't made or even failed -- try again
+					log.Warning("Restarting request due to timeout...")
+					fetchPipeline <- fr
+					continue
+				} else if urlErr, ok := err.(*url.Error); ok {
+					if netErr, ok := (urlErr.Err).(*net.OpError); ok {
+						if _, ok := (netErr.Err).(*net.DNSError); ok && !strings.HasPrefix(domain, "www.") {
+							log.Warning(fmt.Sprintf("DNS error: %s: trying with an added www", domain))
+							// TODO: Don't duplicate above code
+							// I'd prefer to just resubmit to the channel, but channel can be closed earlier if stdin is exhausted
+							urlPath = "http://www." + domain + "/robots.txt"
+							req, _ = http.NewRequest("GET", urlPath, nil)
+							resp, err = client.Do(req)
+							if err != nil {
+								continue
+							}
+							break
+						}
+					}
+				} else {
+					// Otherwise, save as domain with no URL -- implies extreme badness
+					savePipeline <- RobotResponse{domain, "", false, time.Now(), nil, 0}
+					log.Warning(fmt.Sprintf("%s", err))
+					continue
+				}
 			}
-			// Otherwise, save as domain with no URL -- implies extreme badness
-			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil, 0}
-			log.Warning(fmt.Sprintf("%s", err))
-			continue
 		}
 		// Work out what the final request URL is
 		finalUrl := resp.Request.URL.String()
@@ -261,7 +282,7 @@ Loop:
 func main() {
 	logging.SetFormatter(logging.MustStringFormatter(format))
 	logging.SetLevel(logging.INFO, "gogorobot")
-	//logging.SetLevel(logging.DEBUG, "gogorobot")
+	logging.SetLevel(logging.DEBUG, "gogorobot")
 	//
 	// Set the file descriptor limit higher if we've permission
 	var rLimit syscall.Rlimit
