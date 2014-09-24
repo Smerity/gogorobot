@@ -51,9 +51,9 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 	// Set timeout details for HTTP GET requests
 	transport := &httpclient.Transport{
 		// Prime times are useful as one can see when there's an obvious bottleneck
-		ConnectTimeout:        27 * time.Second,
-		RequestTimeout:        31 * time.Second,
-		ResponseHeaderTimeout: 17 * time.Second,
+		ConnectTimeout:        7 * time.Second,
+		RequestTimeout:        9 * time.Second,
+		ResponseHeaderTimeout: 11 * time.Second,
 		// After we use the connection once, we won't be using it again as robots.txt is all we want
 		DisableKeepAlives: true,
 		// In Go 1.2.1, short gzip body responses can result in failures and leaking connections
@@ -78,7 +78,7 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 		lastVia = []*http.Request{}
 		domain := fr.Domain
 		fr.Attempt += 1
-		if fr.Attempt > 5 {
+		if fr.Attempt > 2 {
 			log.Error(fmt.Sprintf("FTCH: Maximum attempts reached for %s", domain))
 			continue
 		}
@@ -87,37 +87,27 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 		urlPath := "http://" + domain + "/robots.txt"
 		req, _ := http.NewRequest("GET", urlPath, nil)
 		resp, err := client.Do(req)
+		// TODO: All these can cause a failure at the end by submitting to the pipeline after it's closed
 		if err != nil {
-			for {
-				if netErr, ok := err.(interface {
-					Timeout() bool
-				}); ok && netErr.Timeout() {
-					// If it's a timeout, the connection wasn't made or even failed -- try again
-					log.Warning("Restarting request due to timeout...")
-					fetchPipeline <- fr
-					continue
-				} else if urlErr, ok := err.(*url.Error); ok {
-					if netErr, ok := (urlErr.Err).(*net.OpError); ok {
-						if _, ok := (netErr.Err).(*net.DNSError); ok && !strings.HasPrefix(domain, "www.") {
-							log.Warning(fmt.Sprintf("DNS error: %s: trying with an added www", domain))
-							// TODO: Don't duplicate above code
-							// I'd prefer to just resubmit to the channel, but channel can be closed earlier if stdin is exhausted
-							urlPath = "http://www." + domain + "/robots.txt"
-							req, _ = http.NewRequest("GET", urlPath, nil)
-							resp, err = client.Do(req)
-							if err != nil {
-								continue
-							}
-							break
-						}
+			if urlErr, ok := err.(*url.Error); ok {
+				if netErr, ok := (urlErr.Err).(*net.OpError); ok {
+					if _, ok := (netErr.Err).(*net.DNSError); ok && !strings.HasPrefix(domain, "www.") {
+						log.Warning(fmt.Sprintf("DNS error: %s: trying with an added www", domain))
+						fr.Domain = "www." + fr.Domain
+						fetchPipeline <- fr
+						continue
 					}
-				} else {
-					// Otherwise, save as domain with no URL -- implies extreme badness
-					savePipeline <- RobotResponse{domain, "", false, time.Now(), nil, 0}
-					log.Warning(fmt.Sprintf("%s", err))
-					continue
+					if netErr.Timeout() || netErr.Temporary() {
+						log.Warning(fmt.Sprintf("Restarting request: %s: timeout / temporary issue... %v", domain, netErr))
+						fetchPipeline <- fr
+						continue
+					}
 				}
 			}
+			// Otherwise, save as domain with no URL -- implies extreme badness
+			savePipeline <- RobotResponse{domain, "", false, time.Now(), nil, 0}
+			log.Warning(fmt.Sprintf("%s", err))
+			continue
 		}
 		// Work out what the final request URL is
 		finalUrl := resp.Request.URL.String()
@@ -282,7 +272,7 @@ Loop:
 func main() {
 	logging.SetFormatter(logging.MustStringFormatter(format))
 	logging.SetLevel(logging.INFO, "gogorobot")
-	logging.SetLevel(logging.DEBUG, "gogorobot")
+	//logging.SetLevel(logging.DEBUG, "gogorobot")
 	//
 	// Set the file descriptor limit higher if we've permission
 	var rLimit syscall.Rlimit
@@ -323,6 +313,8 @@ func main() {
 		log.Debug(fmt.Sprintf("MAIN: Providing %s to fetch pipeline", domain))
 		fetchPipeline <- FetchRequest{domain, 0}
 	}
+	// TODO: Temporary fix to allow time for the pipeline to clear (see TODO in fetcher's error area)
+	time.Sleep(60 * time.Second)
 	close(fetchPipeline)
 	log.Notice("Fetching pipeline closed -- waiting for pending fetches to complete")
 	//
