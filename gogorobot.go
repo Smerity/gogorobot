@@ -75,6 +75,7 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 	}
 	//
 	for fr := range fetchPipeline {
+	FETCH_START:
 		lastVia = []*http.Request{}
 		domain := fr.Domain
 		fr.Attempt += 1
@@ -94,13 +95,12 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 					if _, ok := (netErr.Err).(*net.DNSError); ok && !strings.HasPrefix(domain, "www.") {
 						log.Warning(fmt.Sprintf("DNS error: %s: trying with an added www", domain))
 						fr.Domain = "www." + fr.Domain
-						fetchPipeline <- fr
-						continue
+						goto FETCH_START
 					}
 					if netErr.Timeout() || netErr.Temporary() {
 						log.Warning(fmt.Sprintf("Restarting request: %s: timeout / temporary issue... %v", domain, netErr))
-						fetchPipeline <- fr
-						continue
+						time.Sleep(1 * time.Second)
+						goto FETCH_START
 					}
 				}
 			}
@@ -137,8 +137,8 @@ func fetchRobot(fetchPipeline chan FetchRequest, savePipeline chan RobotResponse
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			log.Warning(fmt.Sprintf("%s", err))
-			fetchPipeline <- fr
-			continue
+			time.Sleep(1 * time.Second)
+			goto FETCH_START
 		}
 		resp.Body.Close()
 		savePipeline <- RobotResponse{domain, finalUrl, true, time.Now(), body, len(lastVia)}
